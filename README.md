@@ -57,7 +57,7 @@ Aggregate from a week of development across 2 TypeScript projects:
 - Without LSP: ~120 Greps + ~180 Reads = ~315k tokens for the same navigation work
 - With LSP: 39 nav calls + 53 targeted Reads = ~84k tokens
 
-## Architecture: 4 Hooks + 1 Tracker
+## Architecture: 6 Hooks + 1 Tracker
 
 ```
                     PreToolUse                          PostToolUse
@@ -66,6 +66,10 @@ Aggregate from a week of development across 2 TypeScript projects:
  Grep call ──→ [lsp-first-guard.js] ──→ BLOCK
                   detects code symbols,
                   suggests LSP equivalent
+
+ Glob call ──→ [lsp-first-glob-guard.js] ──→ BLOCK
+                  blocks *UserService*, **/handleFoo*.ts;
+                  allows *.ts, *subdomain*, src/**
 
  Bash(grep) ──→ [bash-grep-block.js] ──→ BLOCK
                   catches grep/rg/ag/ack
@@ -82,7 +86,23 @@ Aggregate from a week of development across 2 TypeScript projects:
  LSP call ─────────────────────────────────────→ [lsp-usage-tracker.js]
                                                    tracks nav_count,
                                                    read_count, state
+
+                    SessionStart
+                    ────────────
+
+ New session ──→ [lsp-session-reset.js] ──→ WIPE
+                    clears stale nav_count for current cwd,
+                    forces fresh warmup + re-enforces gates
 ```
+
+> **v2 note:** versions before v2 had two silent bypass routes that let
+> Claude read code files without ever calling LSP:
+> (1) `Glob("*SymbolName*")` had no guard, and (2) `nav_count` persisted
+> for 24 h across sessions, so a new session inherited "surgical mode"
+> (unlimited reads) from yesterday's LSP work. Both are closed in v2 by
+> `lsp-first-glob-guard.js` and `lsp-session-reset.js`. If you installed
+> v1, re-run `bash install.sh` — it merges the new hooks without touching
+> your existing settings.
 
 ## How Each Hook Works
 
@@ -116,7 +136,31 @@ LSP tools:
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 ```
 
-### 2. `bash-grep-block.js` — Shell Grep Blocker
+### 2. `lsp-first-glob-guard.js` — Glob Symbol Blocker
+
+**Hook type:** PreToolUse | **Matcher:** `Glob`
+
+Closes the gap where Claude searches for a symbol by *filename pattern* instead of content. Without this hook, `Glob("*UserService*")` silently returns the file, Claude reads it, and LSP enforcement never fires.
+
+The guard parses the glob pattern, extracts alphabetic tokens, and blocks if any token looks like a code symbol (PascalCase, camelCase, or snake_case with 3+ parts). Lowercase-only tokens and short generic words are always allowed.
+
+| Pattern | Detected as | Action |
+|---------|------------|--------|
+| `*UserService*` | PascalCase symbol | BLOCK |
+| `**/AuthProvider.tsx` | PascalCase in path | BLOCK |
+| `*createOrder*` | camelCase symbol | BLOCK |
+| `*handleSubmit*` | camelCase handler | BLOCK |
+| `*get_user_sessions*` | snake_case function | BLOCK |
+| `src/**/*.ts` | extension pattern | allow |
+| `*.tsx`, `**/*.json` | extension pattern | allow |
+| `*subdomain*`, `*auth*` | lowercase concept | allow |
+| `**/middleware*` | file concept | allow |
+| `tsconfig.json`, `next.config.ts` | framework config | allow |
+| `README.md` | docs | allow |
+
+**Allowed by design:** lowercase concept searches (`*auth*`, `*subdomain*`) are legitimate file discovery by topic. Only symbol-shaped tokens (casing patterns) are blocked, because those should use `find_workspace_symbols` instead.
+
+### 3. `bash-grep-block.js` — Shell Grep Blocker
 
 **Hook type:** PreToolUse | **Matcher:** `Bash`
 
@@ -124,7 +168,7 @@ Same detection logic, but for `Bash(grep "UserService" src/)`, `Bash(rg handleSu
 
 Allows: `git grep` (history search), non-code paths, non-code file type filters.
 
-### 3. `lsp-first-read-guard.js` — Progressive Read Gate
+### 4. `lsp-first-read-guard.js` — Progressive Read Gate
 
 **Hook type:** PreToolUse | **Matcher:** `Read`
 
@@ -183,7 +227,7 @@ Session starts
 
 **Dedup:** Reading the same file at different line ranges counts as 1 Read.
 
-### 4. `lsp-pre-delegation.js` — Agent Pre-Resolution
+### 5. `lsp-pre-delegation.js` — Agent Pre-Resolution
 
 **Hook type:** PreToolUse | **Matcher:** `Agent`
 
@@ -215,7 +259,32 @@ Agent({
 | Standard | Implementation agents, worktree-isolated agents | BLOCK during implement phase |
 | Exempt | Reviewers, testers, planners, auditors | Never enforced (read-only) |
 
-### 5. `lsp-usage-tracker.js` — State Tracker
+### 6. `lsp-session-reset.js` — Stale State Wiper
+
+**Hook type:** SessionStart | **Matcher:** `true` (runs on every session start)
+
+The Read guard's state file (`~/.claude/state/lsp-ready-<cwd-hash>`) has a 24-hour expiry. Without this hook, a new session inherits yesterday's `nav_count` — and if that count was ≥ 2, the guard is permanently in **surgical mode** for today's session: unlimited Reads with zero LSP calls required. A full bypass of the enforcement chain.
+
+This hook runs once on session start and deletes the state file for the current cwd. The next Read triggers Gate 1 (warmup required), forcing at least one `get_diagnostics` call before any code file can be opened. After warmup, the standard progression kicks in (Gate 2 → 3 → 4 → 5) requiring real LSP navigation calls before surgical mode unlocks.
+
+**Session lifecycle with reset:**
+```
+Session start
+  │
+  ├─ lsp-session-reset.js → unlinks lsp-ready-<hash>
+  │
+  ├─ Read(page.tsx) → Gate 1 BLOCKS → "warmup required"
+  │
+  ├─ get_diagnostics(file.ts) → tracker writes warmup_done=true
+  │
+  ├─ Read × 2 (free) → Gate 3 warn → Gate 4 block → LSP nav → …
+  │
+  └─ (2 nav calls later) SURGICAL MODE unlocked
+```
+
+**Safety:** the hook only deletes the flag for the current cwd — other projects' state files are left alone. Failure is silent (never blocks session start).
+
+### 7. `lsp-usage-tracker.js` — State Tracker
 
 **Hook type:** PostToolUse | **Matcher:** all `mcp__cclsp__*` tools
 
@@ -253,12 +322,13 @@ Run bash install.sh in this repo to set up LSP enforcement hooks.
 ```
 
 The install script:
-- Copies 5 hooks to `~/.claude/hooks/`
+- Copies 7 hooks to `~/.claude/hooks/`
 - Copies the LSP-first rule to `~/.claude/rules/`
 - **Merges** hook registrations into your existing `~/.claude/settings.json` (won't overwrite your other hooks)
 - Enables the built-in `typescript-lsp` plugin
 - Creates `~/.claude/state/` for tracking
 - Verifies everything at the end
+- Safe to re-run: entries are deduped by command path, so upgrading from v1 to v2 just adds the two new hooks without touching anything else
 
 ### Option 2: Run the script yourself
 
@@ -273,11 +343,11 @@ Output:
 === LSP Enforcement Kit — Install ===
 
 [1/4] Directories ready
-[2/4] Copied 5 hooks + 1 rule
+[2/4] Copied 7 hooks + 1 rule
 [3/4] settings.json updated (merged, not overwritten)
 [4/4] Verifying...
 
-  Hooks installed:  5/5
+  Hooks installed:  7/7
   Rule installed:   yes
   Plugin enabled:   yes
   State directory:  yes
@@ -327,6 +397,10 @@ Add to `PreToolUse` array:
   "hooks": [{ "type": "command", "command": "node ~/.claude/hooks/lsp-first-guard.js" }]
 },
 {
+  "matcher": "Glob",
+  "hooks": [{ "type": "command", "command": "node ~/.claude/hooks/lsp-first-glob-guard.js" }]
+},
+{
   "matcher": "Bash",
   "hooks": [{ "type": "command", "command": "node ~/.claude/hooks/bash-grep-block.js" }]
 },
@@ -346,6 +420,15 @@ Add to `PostToolUse` array:
 {
   "matcher": "mcp__cclsp__find_definition|mcp__cclsp__find_references|mcp__cclsp__find_workspace_symbols|mcp__cclsp__find_implementation|mcp__cclsp__get_hover|mcp__cclsp__get_diagnostics|mcp__cclsp__get_incoming_calls|mcp__cclsp__get_outgoing_calls",
   "hooks": [{ "type": "command", "command": "node ~/.claude/hooks/lsp-usage-tracker.js" }]
+}
+```
+
+Add to `SessionStart` array (create it if missing):
+
+```json
+{
+  "matcher": "true",
+  "hooks": [{ "type": "command", "command": "node ~/.claude/hooks/lsp-session-reset.js" }]
 }
 ```
 
@@ -448,6 +531,9 @@ Claude Code subagents cannot access MCP tools (architectural limitation). Withou
 
 **Q: Known issues?**
 `find_workspace_symbols` fails with "No Project" if called before any file-based LSP tool (cclsp upstream bug). The tracker detects this and tells Claude to call `get_diagnostics` first. Not a timing issue — ordering issue.
+
+**Q: I installed v1 and shared it with my team — should I upgrade?**
+Yes. v1 had two silent bypass routes (Glob symbol search and stale session state) that let Claude navigate code without ever calling LSP. Both are closed in v2. Just re-run `bash install.sh` — it's idempotent and only adds the two missing hook entries to your `settings.json`. No existing configuration is touched.
 
 ## License
 

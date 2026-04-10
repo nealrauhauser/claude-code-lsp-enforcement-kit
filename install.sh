@@ -18,7 +18,7 @@ echo "[1/4] Directories ready"
 # 2. Copy hooks and rule
 cp "$SCRIPT_DIR/hooks/"*.js "$HOOKS_DIR/"
 cp "$SCRIPT_DIR/rules/lsp-first.md" "$RULES_DIR/"
-echo "[2/4] Copied 5 hooks + 1 rule"
+echo "[2/4] Copied 7 hooks + 1 rule"
 
 # 3. Merge into settings.json (node for safe JSON manipulation)
 node -e "
@@ -37,6 +37,7 @@ settings.enabledPlugins['typescript-lsp@claude-plugins-official'] = true;
 // Hook entries to add
 const preToolUse = [
   { matcher: 'Grep', hooks: [{ type: 'command', command: 'node ~/.claude/hooks/lsp-first-guard.js' }] },
+  { matcher: 'Glob', hooks: [{ type: 'command', command: 'node ~/.claude/hooks/lsp-first-glob-guard.js' }] },
   { matcher: 'Bash', hooks: [{ type: 'command', command: 'node ~/.claude/hooks/bash-grep-block.js' }] },
   { matcher: 'Read', hooks: [{ type: 'command', command: 'node ~/.claude/hooks/lsp-first-read-guard.js' }] },
   { matcher: 'Agent', hooks: [{ type: 'command', command: 'node ~/.claude/hooks/lsp-pre-delegation.js' }] },
@@ -49,9 +50,14 @@ const postToolUse = [
   },
 ];
 
+const sessionStart = [
+  { matcher: 'true', hooks: [{ type: 'command', command: 'node ~/.claude/hooks/lsp-session-reset.js' }] },
+];
+
 if (!settings.hooks) settings.hooks = {};
 if (!settings.hooks.PreToolUse) settings.hooks.PreToolUse = [];
 if (!settings.hooks.PostToolUse) settings.hooks.PostToolUse = [];
+if (!settings.hooks.SessionStart) settings.hooks.SessionStart = [];
 
 // Dedupe: skip if command already registered
 function hasHook(arr, command) {
@@ -72,6 +78,12 @@ for (const entry of postToolUse) {
   }
 }
 
+for (const entry of sessionStart) {
+  if (!hasHook(settings.hooks.SessionStart, entry.hooks[0].command)) {
+    settings.hooks.SessionStart.push(entry);
+  }
+}
+
 fs.writeFileSync(path, JSON.stringify(settings, null, 2));
 "
 echo "[3/4] settings.json updated (merged, not overwritten)"
@@ -86,13 +98,13 @@ PLUGIN_OK=$(node -e "
 ")
 
 echo ""
-echo "  Hooks installed:  $HOOKS_COUNT/5"
+echo "  Hooks installed:  $HOOKS_COUNT/7"
 echo "  Rule installed:   $RULE_OK"
 echo "  Plugin enabled:   $PLUGIN_OK"
 echo "  State directory:  $([ -d "$STATE_DIR" ] && echo 'yes' || echo 'no')"
 echo ""
 
-if [ "$HOOKS_COUNT" -eq 5 ] && [ "$RULE_OK" = "yes" ] && [ "$PLUGIN_OK" = "yes" ]; then
+if [ "$HOOKS_COUNT" -eq 7 ] && [ "$RULE_OK" = "yes" ] && [ "$PLUGIN_OK" = "yes" ]; then
   echo "Done. Restart Claude Code to activate."
 else
   echo "WARNING: Some components missing. Check output above."
